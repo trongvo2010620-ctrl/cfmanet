@@ -71,10 +71,12 @@ local config = {
     FruitScanInterval = 1, FruitPickupDistance = 6, FruitPickupConfirm = 2,
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
+    -- [FIX 2 + DELAY 20s] Random token config
     AutoRandomToken = true,
-    RandomCheckIdle = 30,
-    RandomCheckCooldown = 5,
-    RandomFallbackCooldown = 60,
+    RandomCheckIdle = 20,
+    RandomCheckCooldown = 20,
+    RandomFallbackCooldown = 20,
+    RandomStartupDelay = 10,
     WebhookURL = "",
     WebhookEnabled = true, WebhookOnPickup = true, WebhookOnRandom = true, WebhookOnStore = true,
     WebhookMinRarity = "Legendary", WebhookUsername = "Noti Fruit", WebhookTitle = "Noti Fruit",
@@ -188,7 +190,6 @@ local seedRoutes = {
         { "Submerged Stalker", Vector3.new(-16812.89, 54.87, -1312.45) },
     },
 }
-
 -- Known Portal arrival anchors. Camp/mob coordinates are matched to the nearest
 -- anchor, then translated to the actual World Warp label through aliases below.
 local portalDestinations = {
@@ -270,7 +271,6 @@ local portalRouteAliases = {
         ["Tiki Outpost"] = {"Tiki Outpost"},
     },
 }
-
 -- Mesh fallback shared by Fruit pickup and ESP. Direct Tool/Model names remain
 -- the primary signal and Portal-Portal is never classified as an item Fruit.
 local fruitNamesByMeshId = {
@@ -316,11 +316,9 @@ for key, value in pairs(config) do
         if value ~= value or value == math.huge or value == -math.huge then
             error("Invalid EventMagnetConfig." .. key)
         end
-        -- World coordinates may be negative; only durations/distances need a floor.
         config[key] = key == "WaterWalkSurfaceY" and value or math.max(value, 0.05)
     end
 end
--- Haki is mandatory, including each respawn; do not allow a disabled retry loop.
 config.AutoBuso = true
 config.LogLimit = math.clamp(math.floor(config.LogLimit), 10, 300)
 config.ScanInterval = math.max(config.ScanInterval, 0.2)
@@ -347,14 +345,14 @@ config.HopHeartbeatInterval = math.max(30, config.HopHeartbeatInterval)
 config.HopCandidates = math.clamp(math.floor(config.HopCandidates), 1, 10)
 config.HopRequestRetries = math.clamp(math.floor(config.HopRequestRetries), 1, 5)
 config.EventDurationSeconds = math.clamp(config.EventDurationSeconds, 1, 3600)
-config.RandomCheckIdle = math.max(5, math.floor(config.RandomCheckIdle))
-config.RandomCheckCooldown = math.max(1, math.floor(config.RandomCheckCooldown))
-config.RandomFallbackCooldown = math.max(5, math.floor(config.RandomFallbackCooldown))
+config.RandomCheckIdle = math.max(20, math.floor(config.RandomCheckIdle))
+config.RandomCheckCooldown = math.max(20, math.floor(config.RandomCheckCooldown))
+config.RandomFallbackCooldown = math.max(20, math.floor(config.RandomFallbackCooldown))
+config.RandomStartupDelay = math.max(0, math.floor(config.RandomStartupDelay))
 do
     local wanted = string.lower(tostring(config.Team or "Marines"))
     config.Team = (wanted == "pirate" or wanted == "pirates") and "Pirates" or "Marines"
 end
-
 local alive, enabled = true, config.Enabled
 local connections, remotes, mobs = {}, {}, {}
 local targets, logs = {}, {}
@@ -378,10 +376,11 @@ local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
 local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
--- [FIX 1] Random token: tự dò cooldown qua Check, không phụ thuộc event window
+-- [FIX 1 + STARTUP DELAY 10s] Random token: đợi 10s kể từ lúc bật script mới bắt đầu
 local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
-    status = "Cho kiem tra cooldown",
-    nextCheck = 0,
+    status = "Cho " .. config.RandomStartupDelay .. "s khoi dong truoc khi random",
+    nextCheck = os.clock() + config.RandomStartupDelay,
+    startupAt = os.clock() + config.RandomStartupDelay,
     tokenNow = 0,
     tokenNeed = 500,
     cooldownLeft = 0,
@@ -708,7 +707,6 @@ local function scanMobs()
         end
     end
 end
-
 local function normalizeAssetId(value)
     return value ~= nil and string.match(tostring(value), "%d+") or nil
 end
@@ -928,8 +926,6 @@ local function getStoreSummary()
     end
     return owned, blocked, waiting
 end
--- Webhook format/events/rarity filter adapted from auto_factory.lua.
--- Only this queue sends HTTP; no Worker, hop API or downloaded code.
 local sendFruitWebhook
 do
     local fruitInfo, queue = nil, {}
@@ -993,7 +989,6 @@ do
         if config.WebhookBannerURL:match("^https://") then embed.thumbnail = {url = config.WebhookBannerURL} end
         local payload = {content = config.WebhookPing, username = config.WebhookUsername, embeds = {embed},
             allowed_mentions = {parse = {}}}
-        -- Pings are opt-in; never infer @everyone from a fruit notification.
         if config.WebhookPing == "@everyone" or config.WebhookPing == "@here" then
             payload.allowed_mentions = {parse = {"everyone"}}
         end
@@ -1058,7 +1053,6 @@ local function startStore(item, force)
             return commF:InvokeServer("StoreFruit", storageName, item)
         end)
         if not actionIsCurrent("store", token) then return end
-        -- auto_factory: wait briefly for the Tool to leave the inventory.
         local deadline = os.clock() + 0.5
         while actionIsCurrent("store", token) and os.clock() < deadline do task.wait(0.1) end
         if not actionIsCurrent("store", token) then return end
@@ -1075,8 +1069,6 @@ local function startStore(item, force)
             log("STORE", short(item.Name, 80) .. ": da luu")
             sendFruitWebhook("Stored", item.Name, item, storageName)
         else
-            -- Ported from auto_factory: a completed call with a remaining Tool
-            -- is skipped for this instance; transport failures remain retryable.
             local permanent = ok and (stillOwned or responseRejectsStore(response))
             record.blocked = permanent or false
             record.retryAt = os.clock() + config.StoreRetryDelay
@@ -1110,7 +1102,6 @@ connect(workspace.ChildAdded, function(child)
 end)
 connect(workspace.ChildRemoved, removeFruitRecord)
 refreshFruits()
-
 -- Same lifecycle as auto_factory: watch while enabled, not just a short roll timer.
 do
     local spinnerController, lastClose = nil, 0
@@ -1165,8 +1156,6 @@ do
         end
     end)
 end
--- Auto Buso adapted from auto_factory.lua: remote, HasBuso confirmation,
--- then J fallback. One session-bound coroutine; never blocks combat Heartbeat.
 do
     task.spawn(function()
         local function current(character)
@@ -1199,7 +1188,6 @@ do
                             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.J, false, game)
                             task.wait(0.05)
                         end)
-                        -- Always release J, even if Stop/respawn happened during the press.
                         pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.J, false, game) end)
                         if pressed then hasBuso = confirmed(character, 0.75) end
                     end
@@ -1336,7 +1324,6 @@ local function findGatewayButton(scrolling, destinationName)
             end
         end
     end
-    -- Some game versions append the Sea/status to the visible button label.
     for _, alias in ipairs(aliases) do
         local wanted = normalizePortalText(alias)
         if #wanted >= 5 then
@@ -1383,7 +1370,6 @@ closePortalMenu = function()
             break
         end
     end
-    -- Local UI cleanup only; this is not a claim that a server warp was cancelled.
     if gateway.Parent then gateway.Visible = false end
 end
 local function tryStartPortal(targetPosition, root, humanoid, forCombat)
@@ -1490,8 +1476,6 @@ local function tryStartPortal(targetPosition, root, humanoid, forCombat)
     return true
 end
 
--- Adapted from the user's Standalone Low Player Server Hop (Multi-Account).
--- All waits belong to this farm session; no second movement/controller loop.
 local hopRandom = Random.new()
 local hopVisited = {}
 do
@@ -1536,7 +1520,6 @@ local function hopCall(token, callback)
     local deadline = os.clock() + config.HopBrowserTimeout
     while not done and hopAllowed(token) and os.clock() < deadline do task.wait(0.1) end
     if not done then
-        -- A yielded request cannot be revoked; don't accumulate more requests.
         hop.blocked = true
         return false, "Request timeout/da huy; dung hop phien nay"
     end
@@ -1604,7 +1587,6 @@ local function findHopCandidates(token, occupied)
     end
     local best = chooseHopCandidate(candidates)
     if best then return best end
-    -- User script's Roblox public-server API fallback, always the current PlaceId.
     local cursor = ""
     for page = 1, 4 do
         if not hopAllowed(token) or hop.blocked then return nil end
@@ -1653,7 +1635,6 @@ local function requestHopTeleport(token, candidate)
     if not queueContinuation() then return "cancelled" end
     if not hopAllowed(token) then return "cancelled" end
     saveVisitedServer(candidate.id)
-    -- Accept our chosen fallback server after re-execute, avoiding a hop chain.
     pcall(function()
         TeleportService:SetTeleportSetting("EventMagnetChosenServer", {
             id = candidate.id, expires = os.time() + 120,
@@ -1675,8 +1656,6 @@ local function requestHopTeleport(token, candidate)
         if candidate.browser then
             ok, err = pcall(function() candidate.browser:InvokeServer("teleport", candidate.id) end)
         end
-        -- Match supplied fallback only on a thrown call error or missing browser;
-        -- never send a second route after Started or an explicit restriction.
         if not ok and not started and not failed and hopAllowed(token) then
             ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, candidate.id, player) end)
         end
@@ -1694,7 +1673,6 @@ local function requestHopTeleport(token, candidate)
         hop.status = "Teleport chua ro ket qua; dung hop phien nay"
         return "pending"
     end
-    -- A completed request with no departure can retry as in the supplied script.
     hop.status = failureMessage or "Van o server cu sau timeout; thu server khac"
     log("HOP", hop.status)
     return "retry"
@@ -1735,8 +1713,6 @@ local function startHop(startup)
 end
 
 local islandMode = sea == 1 and config.Sea1IslandMode and config.Patrol
--- Explicit groups: a completed island cannot be re-added by a new spawn marker.
--- Sky regions at different elevations are separate stops to allow streaming.
 local sea1Islands = {
     ["Bandit"] = "Starter Pirate",
     ["Monkey"] = "Jungle", ["Gorilla"] = "Jungle",
@@ -1760,14 +1736,12 @@ local function islandAt(position)
         local delta = (row[2] - position).Magnitude
         if delta < distance then name, distance = sea1Islands[row[1]], delta end
     end
-    -- Extra regions discovered from live markers use their own anchor.
     for _, point in ipairs(patrol.points) do
         local delta = (point.position - position).Magnitude
         if delta < distance then name, distance = point.name, delta end
     end
     return name
 end
--- Exact normalized names also cover spawn markers without a [Boss] suffix.
 local patrolBossNames = {}
 for _, name in ipairs({
     "Gorilla King", "Bobby", "The Saw", "Yeti", "Mob Leader", "Vice Admiral",
@@ -1781,19 +1755,14 @@ for _, name in ipairs({
 }) do
     patrolBossNames[name:lower():gsub("[^%w]", "")] = true
 end
--- User-excluded Sea 2 camps. Filter both seed routes and live spawn markers
--- before merging, so marker refresh cannot reintroduce Kingdom of Rose stops.
 local kingdomOfRoseCamps = {
     raider = true, mercenary = true, swanpirate = true, factorystaff = true,
     kingdomofrose = true,
 }
 local function addPatrolPoint(name, position, source)
-    -- Boss respawn timers are not farm camps. Filter before stripping [Boss]
-    -- or merging nearby markers, so they never add a stop to the patrol route.
     local spawnName = string.lower(tostring(name or ""))
     local bareName = spawnName:gsub("%b[]", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     local bossKey = bareName:gsub("magnetized", ""):gsub("[^%w]", "")
-    -- Factory Core markers may have no [Boss] suffix. Never add/merge this stop.
     if bossKey == "core" or bossKey == "factorycore" then return false end
     if sea == 2 and kingdomOfRoseCamps[bossKey] then return false end
     if spawnName:find("%f[%a]boss%f[%A]") or patrolBossNames[bossKey]
@@ -1803,7 +1772,7 @@ local function addPatrolPoint(name, position, source)
     if typeof(position) ~= "Vector3" then return false end
     for _, coordinate in ipairs({position.X, position.Y, position.Z}) do
         if coordinate ~= coordinate or math.abs(coordinate) == math.huge then return false end
-    end    -- Strip level/event suffixes so every Mercenary spawn belongs to its camp.
+    end
     local mobKey = string.lower(tostring(name)):gsub("%b[]", "")
         :gsub("magnetized", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     if islandMode then
@@ -1831,7 +1800,6 @@ local function addPatrolPoint(name, position, source)
             nearest.radius = math.max(nearest.radius, nearestDistance + config.SpawnRadius)
         end
         nearest.mobKeys[mobKey] = true
-        -- Keep the visit anchor and visited flag stable during marker refresh.
         return false
     end
     table.insert(patrol.points, { name = short(name, 80), position = position,
@@ -1839,1276 +1807,3 @@ local function addPatrolPoint(name, position, source)
         mobKeys = { [mobKey] = true }, members = { [memberKey] = true }, spawnCount = 1 })
     return true
 end
-function api.AddPatrolPoint(name, position)
-    if not alive then return false end
-    return addPatrolPoint(name, position, "manual")
-end
-function api.GetPatrol()
-    local points, visited = {}, 0
-    for _, point in ipairs(patrol.points) do
-        if point.visited == patrol.pass then visited = visited + 1 end
-        table.insert(points, { name = point.name, position = point.position,
-            spawnCount = point.spawnCount, radius = point.radius,
-            source = point.source, visited = point.visited == patrol.pass, retryAt = point.retryAt })
-    end
-    return { pass = patrol.pass, visited = visited, total = #points, points = points,
-        current = patrol.current and patrol.current.name or nil,
-        mode = islandMode and "island" or "camp" }
-end
-function api.GetState()
-    local owned, blocked, waiting = getStoreSummary()
-    return {
-        alive = alive, enabled = enabled, sea = sea, action = action.kind,
-        eventActive = eventWindow.active, eventRemaining = eventWindow.remaining,
-        hopBlocked = hop.blocked == true,
-        status = status, magnetized = #targets, worldFruits = #api.GetFruits(),
-        ownedFruits = #owned, blockedFruits = blocked, waitingStore = waiting,
-        portal = portal.lastResult, portalDestination = portal.destination,
-        hopChecked = hop.checked, hopBusy = hop.busy, hopStatus = hop.status,
-        playerCount = #Players:GetPlayers(), session = sessionSerial,
-        randomStatus = randomToken.status,
-        randomToken = randomToken.tokenNow,
-        randomCooldown = randomToken.cooldownLeft,
-    }
-end
-for _, row in ipairs(seedRoutes[sea] or {}) do addPatrolPoint(row[1], row[2], "local database") end
-local function refreshSpawnPoints()
-    local origin = workspace:FindFirstChild("_WorldOrigin")
-    local folder = origin and origin:FindFirstChild("EnemySpawns")
-    if not folder then return end
-    for _, instance in ipairs(folder:GetDescendants()) do
-        -- A Model marker contributes its pivot once, not every decorative part.
-        local ancestor, nested = instance.Parent, false
-        while ancestor and ancestor ~= folder do
-            if ancestor:IsA("Model") then nested = true; break end
-            ancestor = ancestor.Parent
-        end
-        if not nested and instance:IsA("BasePart") then
-            addPatrolPoint(instance.Name, instance.Position, "EnemySpawns")
-        elseif not nested and instance:IsA("Model") and instance:FindFirstChildWhichIsA("BasePart", true) then
-            addPatrolPoint(instance.Name, instance:GetPivot().Position, "EnemySpawns")
-        end
-    end
-end
-refreshSpawnPoints()
-local function finishPatrolPoint(reason, failed)
-    local point = patrol.current
-    if point then
-        point.visited = patrol.pass
-        if failed then point.retryAt = os.clock() + config.RetryDelay end
-        log("PATROL", point.name .. ": " .. reason)
-    end
-    patrol.current, patrol.arrived, patrol.started = nil, nil, nil
-    patrol.seenAt = nil
-    patrol.best = math.huge
-    releaseMovement()
-end
-local function patrolStep(root, humanoid, dt, now)
-    if not config.Patrol then
-        releaseMovement(); status = "Cho quai Magnetized; tuan tra dang tat"; return
-    end
-    if not patrol.current then
-        local nearest, remaining = math.huge, false
-        for _, point in ipairs(patrol.points) do
-            if point.visited ~= patrol.pass then
-                remaining = true
-                local distance = (point.position - root.Position).Magnitude
-                if point.retryAt <= now and distance < nearest then
-                    patrol.current, nearest = point, distance
-                end
-            end
-        end
-        if not patrol.current then
-            releaseMovement()
-            if #patrol.points == 0 then
-                status = "Chua co diem spawn; cho EnemySpawns hoac AddPatrolPoint"
-            elseif not remaining then
-                local mythical, fruitName = hasMythicalFruit()
-                if mythical then
-                    status = "Xong vong; chan hop: Mythical " .. tostring(fruitName)
-                elseif hop.blocked then
-                    status = hop.status
-                elseif now >= hop.retryAt then
-                    startHop()
-                    status = hop.status
-                else
-                    status = "Xong vong; cho thu hop " .. math.ceil(hop.retryAt - now) .. "s"
-                end
-            else
-                status = "Cho cooldown cac bai bi ket..."
-            end
-            return
-        end
-        log("PATROL", "Den " .. patrol.current.name .. " | vong " .. patrol.pass)
-    end
-    local point = patrol.current
-    local destination = point.position + Vector3.new(0, config.PatrolHeight, 0)
-    local distance = (destination - root.Position).Magnitude
-    if not patrol.started then
-        patrol.started, patrol.progress, patrol.best = now, now, distance
-        patrol.deadline = now + math.max(45, distance / config.Speed * 3 + 30)
-    end
-    if distance <= config.PatrolArrival then
-        if not patrol.arrived then patrol.arrived = now end
-        local elapsed = now - patrol.arrived
-        local seenNPC = false
-        for model in pairs(mobs) do
-            local h, r = livingNPC(model)
-            if h and (r.Position - point.position).Magnitude <= (point.radius or config.SpawnRadius)
-                and math.abs(r.Position.Y - point.position.Y) <= config.CampHeightTolerance then
-                seenNPC = true; break
-            end
-        end
-        status = "Quan sat bai " .. point.name .. " (" .. point.spawnCount .. " diem spawn) | " .. math.floor(elapsed)
-            .. "s | " .. (seenNPC and "co quai" or "cho spawn")
-        if seenNPC then patrol.seenAt = patrol.seenAt or now else patrol.seenAt = nil end
-        local settleTime = islandMode and config.SpawnSettleTime or config.CampSettleTime
-        local settled = patrol.seenAt and now - patrol.seenAt >= settleTime
-        local waitTime = islandMode and config.IslandWait or config.CampSettleTime
-        local timeout = islandMode and config.IslandSpawnTimeout or config.SpawnTimeout
-        if elapsed >= timeout or (settled and elapsed >= waitTime) then
-            local reason = islandMode and "khong con Magnetized hop le; bo qua dao trong vong nay"
-                or (seenNPC and "da quan sat; sang bai tiep" or "het cho spawn; thu lai vong sau")
-            finishPatrolPoint(reason)
-            return
-        end
-        patrol.progress, patrol.best = now, distance
-    else
-        patrol.arrived = nil -- Server correction does not count as waiting at camp.
-        patrol.seenAt = nil
-        if distance < patrol.best - 2 then patrol.best, patrol.progress = distance, now end
-        if now - patrol.progress > config.NoProgressTimeout or now > patrol.deadline then
-            finishPatrolPoint("khong den duoc; tam bo qua", true); return
-        end
-        status = "Tuan tra " .. point.name .. " | " .. math.ceil(distance) .. " studs"
-    end
-    if distance > config.PatrolArrival and tryStartPortal(point.position, root, humanoid) then
-        status = "Portal den gan " .. point.name
-        return
-    end
-    flyTo(root, humanoid, destination, dt)
-end
-
--- Same Melee/Fighting Style recognition as auto_factory; never substitute a Sword/Fruit.
-local equipState = { character = nil, tool = nil, readyAt = 0, retryAt = 0 }
-local function equip(character, humanoid)
-    local now = os.clock()
-    if equipState.character ~= character then
-        equipState.character, equipState.tool = character, nil
-        equipState.readyAt, equipState.retryAt = 0, 0
-    end
-    if character ~= player.Character or not humanoid or humanoid.Parent ~= character
-        or humanoid.Health <= 0 then return nil, "Character chua san sang" end
-    local function normalize(value)
-        return tostring(value or ""):lower():match("^%s*(.-)%s*$")
-    end
-    local wanted = normalize(config.Weapon)
-    local function matches(tool)
-        if not tool:IsA("Tool") then return false end
-        local tooltip = normalize(tool.ToolTip)
-        if wanted == "melee" or wanted == "fighting style" then
-            return tooltip == "melee" or tooltip == "fighting style"
-        end
-        return tooltip == wanted or normalize(tool.Name) == wanted
-    end
-    for _, tool in ipairs(character:GetChildren()) do
-        if matches(tool) then
-            if equipState.tool ~= tool then
-                equipState.tool, equipState.readyAt = tool, now + 0.25
-            end
-            if now < equipState.readyAt then return nil, "Cho equip: " .. tool.Name end
-            return tool
-        end
-    end
-    -- Losing the equipped tool (Portal, pickup, respawn) requires a new settle window.
-    equipState.tool = nil
-    local backpack = player:FindFirstChildOfClass("Backpack")
-    if backpack then
-        for _, tool in ipairs(backpack:GetChildren()) do
-            if matches(tool) then
-                if now < equipState.retryAt then return nil, "Dang equip: " .. tool.Name end
-                equipState.retryAt = now + 0.75
-                local ok = pcall(function() humanoid:EquipTool(tool) end)
-                if not ok then return nil, "Equip that bai: " .. tool.Name end
-                if tool.Parent == character then
-                    equipState.tool, equipState.readyAt = tool, now + 0.25
-                end
-                -- Do not send an attack in the same tick as EquipTool.
-                return nil, "Cho equip: " .. tool.Name
-            end
-        end
-    end
-    return nil, "Khong tim thay vu khi: " .. tostring(config.Weapon)
-end
--- Resolver adapted from auto_factory.lua ResolveCombatRemotes/TrySourceMeleeAttack.
--- Module require may yield: resolve in one background task, never the Heartbeat.
-local combatRemote = { register = nil, hit = nil, resolving = false, retryAt = 0,
-    status = "Cho combat remotes" }
-local function resolveCombatRemotes()
-    if combatRemote.register and combatRemote.register.Parent
-        and combatRemote.hit and combatRemote.hit.Parent then return true end
-    if combatRemote.resolving or os.clock() < combatRemote.retryAt then return false end
-    local modules = RS:FindFirstChild("Modules")
-    local net = modules and modules:FindFirstChild("Net")
-    local register = net and net:FindFirstChild("RE/RegisterAttack")
-    local hit = net and net:FindFirstChild("RE/RegisterHit")
-    combatRemote.retryAt = os.clock() + 2
-    if register and register:IsA("RemoteEvent") and hit and hit:IsA("RemoteEvent") then
-        combatRemote.register, combatRemote.hit = register, hit
-        return true
-    end
-    if not register or not net or not net:IsA("ModuleScript") then
-        combatRemote.status = "Thieu Modules.Net/RegisterAttack"
-        return false
-    end
-    combatRemote.resolving, combatRemote.status = true, "Dang lay RegisterHit qua Modules.Net"
-    task.spawn(function()
-        local ok, result = pcall(function()
-            local netApi = require(net)
-            return netApi:RemoteEvent("RegisterHit", true)
-        end)
-        if not alive or sessionSerial ~= env.__EventMagnetSessionSerial then return end
-        combatRemote.resolving = false
-        if ok and typeof(result) == "Instance" and result:IsA("RemoteEvent") then
-            combatRemote.register, combatRemote.hit = register, result
-            combatRemote.status = "Attack No Animation"
-        else
-            combatRemote.status = "Khong lay duoc RegisterHit"
-            log("COMBAT", combatRemote.status .. ": " .. short(result, 80))
-        end
-    end)
-    return false
-end
-local function attack(mobRoot, tool)
-    local character = player.Character
-    if not character or not tool or tool.Parent ~= character then
-        return false, "Vu khi chua duoc equip"
-    end
-    if not mobRoot or not mobRoot.Parent then return false, "Muc tieu da bien mat" end
-    if not config.AttackNoAnimation then
-        local ok, err = pcall(function() tool:Activate() end)
-        return ok, ok and "Tool attack" or short(err, 80)
-    end
-    if not resolveCombatRemotes() then return false, combatRemote.status end
-    local ok, err = pcall(function()
-        combatRemote.register:FireServer(0)
-        combatRemote.hit:FireServer(mobRoot, {})
-    end)
-    if not ok then
-        combatRemote.register, combatRemote.hit = nil, nil
-        combatRemote.status = "Combat remote loi: " .. short(err, 80)
-    end
-    return ok, ok and "Attack No Animation" or combatRemote.status
-end
-
-local function nearestFruit(root, now)
-    local best, distance
-    for instance, record in pairs(fruitRecords) do
-        if instance:IsDescendantOf(workspace) and record.part and record.part.Parent
-            and record.retryAt <= now then
-            local candidateDistance = (record.part.Position - root.Position).Magnitude
-            if not distance or candidateDistance < distance then
-                best, distance = record, candidateDistance
-            end
-        end
-    end
-    return best, distance
-end
-local function failFruit(record, reason)
-    record.attempts = record.attempts + 1
-    if record.attempts >= config.FruitPickupAttempts then
-        record.retryAt, record.attempts = os.clock() + config.FruitRetryDelay, 0
-    end
-    log("FRUIT", record.name .. ": " .. reason)
-    fruitTask.target, fruitTask.started = nil, nil
-    releaseMovement()
-end
-local function startFruitPickup(record, root, humanoid)
-    local token = beginAction("pickup")
-    if not token then return false end
-    releaseMovement()
-    task.spawn(function()
-        local snapshot = {}
-        for _, item in ipairs(ownedFruitTools()) do snapshot[item] = true end
-        local oldCanTouch = {}
-        local found, touched, aborted = nil, false, false
-        local ok, runtimeError = xpcall(function()
-            if not actionIsCurrent("pickup", token) or hasLiveMagnetized() then
-                aborted = true; return
-            end
-            local character = player.Character
-            if not character or not humanoid.Parent or not root.Parent then error("Character da thay doi") end
-            pcall(function()
-                humanoid:UnequipTools()
-                humanoid.Sit, humanoid.PlatformStand = false, false
-            end)
-            for _, part in ipairs(character:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    oldCanTouch[part] = part.CanTouch
-                    pcall(function() part.CanTouch = true end)
-                end
-            end
-            local handle = record.part
-            touched = pcall(function()
-                root.CFrame = handle.CFrame
-                root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                if type(firetouchinterest) == "function" then
-                    firetouchinterest(root, handle, 0); task.wait(0.03); firetouchinterest(root, handle, 1)
-                    local right = character:FindFirstChild("RightFoot") or character:FindFirstChild("Right Leg")
-                    local left = character:FindFirstChild("LeftFoot") or character:FindFirstChild("Left Leg")
-                    for _, foot in pairs({ right, left }) do
-                        if foot then firetouchinterest(foot, handle, 0); task.wait(0.02); firetouchinterest(foot, handle, 1) end
-                    end
-                end
-                humanoid.Jump = true
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-                task.wait(0.04)
-                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-            end)
-            if not touched then return end
-            local deadline = os.clock() + config.FruitPickupConfirm
-            while actionIsCurrent("pickup", token) and os.clock() < deadline do
-                for _, item in ipairs(ownedFruitTools()) do
-                    if not snapshot[item] and ownedFruitMatches(record, item) then found = item; break end
-                end
-                if found then break end
-                task.wait(0.1)
-            end
-        end, function(err) return tostring(err) end)
-        pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game) end)
-        for part, oldValue in pairs(oldCanTouch) do
-            if part.Parent then pcall(function() part.CanTouch = oldValue end) end
-        end
-        if not actionIsCurrent("pickup", token) then return end
-        endAction("pickup", token)
-        if aborted then return end
-        if not ok then
-            failFruit(record, "Loi pickup: " .. short(runtimeError, 80))
-        elseif not touched then
-            failFruit(record, "Khong kich hoat duoc touch")
-        elseif found then
-            log("FRUIT", "Da xac nhan nhat: " .. short(found.Name, 80))
-            sendFruitWebhook("Picked", found.Name, found, getFruitOriginalName(found))
-            fruitTask.target, fruitTask.started = nil, nil
-        else
-            failFruit(record, "Da cham nhung chua vao inventory")
-        end
-    end)
-    return true
-end
-local function fruitStep(root, humanoid, dt, now)
-    if not config.FruitEnabled then return false end
-    local record = fruitTask.target and fruitRecords[fruitTask.target]
-    if not record or not record.instance:IsDescendantOf(workspace)
-        or not record.part or not record.part.Parent then
-        record = nearestFruit(root, now)
-        fruitTask.target = record and record.instance or nil
-        fruitTask.started, fruitTask.progress, fruitTask.best = now, now, math.huge
-    end
-    if not record then return false end
-    local distance = (record.part.Position - root.Position).Magnitude
-    if distance < fruitTask.best - 2 then
-        fruitTask.best, fruitTask.progress = distance, now
-    elseif now - fruitTask.progress > config.NoProgressTimeout then
-        failFruit(record, "Di chuyen khong tien trien")
-        return true
-    end
-    if distance <= config.FruitPickupDistance then
-        status = "Dang nhat " .. short(record.name, 60)
-        startFruitPickup(record, root, humanoid)
-        return true
-    end
-    if tryStartPortal(record.part.Position, root, humanoid) then
-        status = "Portal den Fruit " .. short(record.name, 50)
-        return true
-    end
-    status = "Den Fruit " .. short(record.name, 55) .. " | " .. math.ceil(distance) .. " studs"
-    flyTo(root, humanoid, record.part.Position + Vector3.new(0, 2, 0), dt)
-    return true
-end
-
--- [FIX 3] Random Token: tự dò cooldown + token qua Check, không phụ thuộc event window.
--- State: idle -> check -> (chờ token / chờ cooldown / đủ điều kiện) -> Purchase -> check lại
-local function randomTokenStep()
-    if not alive or not enabled or not config.AutoRandomToken then return end
-    if randomToken.locked or randomToken.busy or action.kind then return end
-
-    local now = os.clock()
-    if now < randomToken.nextCheck then return end
-
-    local character = player.Character
-    local hum = character and character:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 or not currentTeamName()
-        or not character:FindFirstChild("HasBuso") then return end
-
-    -- Nhường việc ưu tiên cao hơn (store đang chờ)
-    local owned, blocked = getStoreSummary()
-    if #owned > blocked then return end
-
-    local modules = RS:FindFirstChild("Modules")
-    local net = modules and modules:FindFirstChild("Net")
-    local rf = net and net:FindFirstChild("RF/GachaNetworkRF")
-    if not rf or not rf:IsA("RemoteFunction") then
-        randomToken.nextCheck = now + 5
-        randomToken.status = "Chua tim thay GachaNetworkRF"
-        return
-    end
-
-    randomToken.busy = true
-    randomToken.serial = randomToken.serial + 1
-    local serial = randomToken.serial
-    local function current()
-        return alive and env.EventMagnetFarm == api and randomToken.serial == serial
-    end
-    -- Timeout an toàn: nếu request treo quá 20s thì mở khoá
-    task.delay(20, function()
-        if current() and randomToken.busy then
-            randomToken.locked, randomToken.status = true, "Timeout: khoa random, cho ket qua"
-        end
-    end)
-
-    task.spawn(function()
-        local dispatched = false
-        local ok, err = pcall(function()
-            -- ===== BƯỚC 1: CHECK =====
-            local a, b = rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
-            if not current() then return end
-            local req = type(b) == "table" and b or (type(a) == "table" and a)
-            local price = req and req.Price
-            if not req or type(req.RequirementsMet) ~= "boolean" or type(price) ~= "table"
-                or tonumber(price.ItemId) ~= 1574 or tonumber(price.Value) ~= 500
-                or type(price.Current) ~= "number" then
-                randomToken.locked, randomToken.status = true, "Du lieu/gia thay doi: dung random"
-                return
-            end
-
-            randomToken.tokenNow = tonumber(price.Current) or 0
-            randomToken.tokenNeed = tonumber(price.Value) or 500
-            randomToken.requirementMet = req.RequirementsMet == true
-
-            -- ===== BƯỚC 2: ĐỌC COOLDOWN =====
-            local cooldown = req.Cooldown
-            local cdLeft = 0
-            local cooldownBlocked = false
-            if type(cooldown) == "table" then
-                cdLeft = tonumber(cooldown.TimeLeft) or tonumber(cooldown.Remaining)
-                    or tonumber(cooldown.Duration) or 0
-                if type(cooldown.RequirementMet) == "boolean"
-                    and cooldown.RequirementMet == false and cdLeft <= 0 then
-                    cdLeft = config.RandomFallbackCooldown
-                    cooldownBlocked = true
-                end
-            end
-            randomToken.cooldownLeft = math.max(cdLeft, 0)
-
-            -- ===== BƯỚC 3: QUYẾT ĐỊNH =====
-            local tokenReady = randomToken.tokenNow >= randomToken.tokenNeed
-            local cooldownReady = randomToken.cooldownLeft <= 0 and not cooldownBlocked
-
-            if not tokenReady then
-                randomToken.nextCheck = os.clock() + config.RandomCheckIdle
-                randomToken.status = string.format("Token %d/%d (cho %ds)",
-                    randomToken.tokenNow, randomToken.tokenNeed, config.RandomCheckIdle)
-                return
-            end
-            if not randomToken.requirementMet then
-                randomToken.nextCheck = os.clock() + 10
-                randomToken.status = "Chua du dieu kien event"
-                return
-            end
-            if not cooldownReady then
-                local wait = math.max(randomToken.cooldownLeft, 1) + config.RandomCheckCooldown
-                randomToken.nextCheck = os.clock() + wait
-                randomToken.status = string.format("Cooldown %ds (token %d/%d)",
-                    math.ceil(randomToken.cooldownLeft),
-                    randomToken.tokenNow, randomToken.tokenNeed)
-                return
-            end
-
-            -- ===== BƯỚC 4: PURCHASE =====
-            if not current() or not enabled or randomToken.locked then return end
-            if player.Character ~= character or hum.Health <= 0 then return end
-            if not character:FindFirstChild("HasBuso") then return end
-
-            local before = {}
-            for _, item in ipairs(ownedFruitTools()) do before[item] = true end
-
-            dispatched = true
-            randomToken.status = "Quay 500 Magnet Token"
-            local accepted = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
-            if not current() then return end
-
-            if accepted == false then
-                randomToken.nextCheck = os.clock() + 5
-                randomToken.status = "Server tu choi; Check lai sau 5s"
-                return
-            elseif accepted ~= true then
-                randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
-                return
-            end
-
-            -- Chờ Tool mới xuất hiện
-            local rewards = {}
-            local rewardDeadline = os.clock() + 8
-            repeat
-                task.wait(0.1)
-                if not current() then return end
-                rewards = {}
-                for _, item in ipairs(ownedFruitTools()) do
-                    if not before[item] then rewards[#rewards + 1] = item.Name end
-                end
-            until #rewards > 0 or os.clock() >= rewardDeadline
-
-            randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
-                or "Server chap nhan; chua thay Fruit"
-            log("RANDOM", randomToken.status)
-            for _, item in ipairs(ownedFruitTools()) do
-                if not before[item] then
-                    sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item))
-                end
-            end
-
-            -- ===== BƯỚC 5: ĐỌC LẠI COOLDOWN MỚI =====
-            task.wait(1)
-            if not current() then return end
-            local ok2, a2, b2 = pcall(function()
-                return rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
-            end)
-            if ok2 and current() then
-                local req2 = type(b2) == "table" and b2 or (type(a2) == "table" and a2)
-                if req2 and type(req2.Cooldown) == "table" then
-                    local cd2 = tonumber(req2.Cooldown.TimeLeft)
-                        or tonumber(req2.Cooldown.Remaining)
-                        or tonumber(req2.Cooldown.Duration) or 0
-                    randomToken.cooldownLeft = math.max(cd2, 0)
-                else
-                    randomToken.cooldownLeft = config.RandomFallbackCooldown
-                end
-                randomToken.tokenNow = req2 and req2.Price
-                    and tonumber(req2.Price.Current) or 0
-                randomToken.nextCheck = os.clock()
-                    + math.max(randomToken.cooldownLeft, 1) + config.RandomCheckCooldown
-                randomToken.status = string.format("Cooldown moi %ds; token %d/%d",
-                    math.ceil(randomToken.cooldownLeft),
-                    randomToken.tokenNow, randomToken.tokenNeed)
-            else
-                randomToken.nextCheck = os.clock() + 30
-                randomToken.status = "Da quay; cho check lai cooldown"
-            end
-        end)
-
-        if not current() then return end
-        if not ok then
-            log("RANDOM", "Loi: " .. short(err, 120))
-            randomToken.nextCheck = os.clock() + 15
-            randomToken.status = "Loi Check; thu lai sau 15s"
-        end
-        randomToken.busy = false
-    end)
-end
--- Adapted from giayeuem.lua SourceBringMob: same radius/count/throttle and
--- other-player guard, but only living Magnetized NPCs are eligible.
-local bringState = { at = 0, parts = setmetatable({}, { __mode = "k" }) }
-local function restoreBring()
-    for part, original in pairs(bringState.parts) do
-        if part.Parent then pcall(function() part.CanCollide = original end) end
-    end
-    bringState.parts = setmetatable({}, { __mode = "k" })
-end
-local function bringEventMobs(root, mobRoot, now)
-    if not config.BringMobs or now - bringState.at < config.BringMobInterval then return end
-    bringState.at = now
-    restoreBring()
-    if (root.Position - mobRoot.Position).Magnitude > config.BringActivationRange then return end
-    local function otherPlayerNear(position)
-        for _, other in ipairs(Players:GetPlayers()) do
-            local otherRoot = other ~= player and rootOf(other.Character)
-            if otherRoot and (otherRoot.Position - position).Magnitude <= config.BringPlayerSafeRange then
-                return true
-            end
-        end
-        return false
-    end
-    if otherPlayerNear(mobRoot.Position) then return end
-    local count = 0
-    for _, model in ipairs(targets) do
-        if count >= math.max(math.floor(config.BringMobCount) - 1, 0) then break end
-        local h, r = livingNPC(model)
-        if model ~= target and h and isMagnetized(model, h) and not model:FindFirstChild("Ignored")
-            and (skipped[model] or 0) <= now
-            and (r.Position - mobRoot.Position).Magnitude <= config.BringMobRadius
-            and not otherPlayerNear(r.Position) then
-            local owned = true
-            if type(isnetworkowner) == "function" then
-                local ok, result = pcall(isnetworkowner, r)
-                owned = ok and result == true
-            end
-            if owned then
-                pcall(function()
-                    for _, part in ipairs(model:GetDescendants()) do
-                        if part:IsA("BasePart") then
-                            bringState.parts[part] = part.CanCollide
-                            part.CanCollide = false
-                        end
-                    end
-                    r.AssemblyLinearVelocity, r.AssemblyAngularVelocity = Vector3.zero, Vector3.zero
-                    r.CFrame = mobRoot.CFrame * CFrame.new(0, math.random(0, 2), math.random(0, 2))
-                end)
-                count = count + 1
-            end
-        end
-    end
-end
-local seatGuard = { humanoid = nil, original = nil }
-local function restoreSeatGuard()
-    if seatGuard.humanoid and seatGuard.humanoid.Parent then
-        pcall(function()
-            seatGuard.humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, seatGuard.original)
-        end)
-    end
-    seatGuard.humanoid, seatGuard.original = nil, nil
-end
-local function needsMovement()
-    if not alive or not enabled then return false end
-    local character = player.Character
-    local root = rootOf(character)
-    if not root or not character:FindFirstChild("HasBuso") or not teamSelect.ready then return false end
-    if action.kind == "hop" then return false end
-    if action.kind == "portal" or action.kind == "pickup" then return true end
-    if hasLiveMagnetized() then return true end
-    if action.kind == "store" then return false end
-    if config.Patrol and (not config.EventScheduleEnabled or eventWindow.active) and #patrol.points > 0 then return true end
-    if config.FruitEnabled and not eventWindow.active then
-        local owned, blocked = getStoreSummary()
-        return #owned == blocked and nearestFruit(root, os.clock()) ~= nil
-    end
-    return false
-end
-local function updateSeatGuard()
-    local character = player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local moving = needsMovement()
-    if seatGuard.humanoid ~= humanoid or not moving then restoreSeatGuard() end
-    if not moving or not humanoid or humanoid.Health <= 0 then return end
-    if not seatGuard.humanoid then
-        seatGuard.original = humanoid:GetStateEnabled(Enum.HumanoidStateType.Seated)
-        seatGuard.humanoid = humanoid
-    end
-    humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-end
-local seatRecovery = { root = nil, nextAttempt = 0, pending = false }
-local function recoverFromSeat(root, humanoid, now)
-    if seatRecovery.root ~= root then
-        seatRecovery.root, seatRecovery.nextAttempt, seatRecovery.pending = root, 0, false
-        seatRecovery.started, seatRecovery.clearSince = nil, nil
-    end
-    if not needsMovement() then
-        restoreSeatGuard()
-        seatRecovery.pending, seatRecovery.started, seatRecovery.clearSince = false, nil, nil
-        return false
-    end
-    if humanoid.Sit or humanoid.SeatPart then
-        releaseMovement()
-        seatRecovery.pending = true
-        seatRecovery.started = seatRecovery.started or now
-        seatRecovery.clearSince = nil
-        status = "Dang tu roi ghe de tiep tuc farm"
-        if now - seatRecovery.started >= 6 then
-            api.SetEnabled(false)
-            restoreSeatGuard()
-            status = "Ghe chua nha sau 6s; hay nhay roi ghe va bat lai farm"
-            log("SEAT", status)
-            seatRecovery.started = nil
-            return true
-        end
-        if now >= seatRecovery.nextAttempt then
-            seatRecovery.nextAttempt = now + 0.5
-            humanoid.PlatformStand = false
-            humanoid.Sit = false
-            humanoid.Jump = true
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-        return true
-    end
-    if seatRecovery.pending then
-        seatRecovery.clearSince = seatRecovery.clearSince or now
-        if now - seatRecovery.clearSince < 0.2 then return true end
-        -- Chỉ nâng nhân vật sau khi SeatPart đã nhả để không kéo theo ghế/thuyền.
-        seatRecovery.pending = false
-        seatRecovery.started, seatRecovery.clearSince = nil, nil
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = root.CFrame + Vector3.new(0, 12, 0)
-        patrol.started, patrol.arrived, patrol.seenAt = nil, nil, nil
-        patrol.progress, patrol.best = now, math.huge
-        lastProgress, lastDamage, bestDistance = now, now, math.huge
-        fruitTask.progress, fruitTask.best = now, math.huge
-        status = "Da roi ghe; tiep tuc farm"
-        log("FARM", status)
-    end
-    return false
-end
--- Match the fought mob to its actual camp, not the interrupted patrol stop.
-local function combatCampAt(position)
-    local best, distance
-    for _, point in ipairs(patrol.points) do
-        local delta = (point.position - position).Magnitude
-        if delta <= point.radius and math.abs(point.position.Y - position.Y) <= config.CampHeightTolerance
-            and (not distance or delta < distance) then best, distance = point, delta end
-    end
-    return best
-end
-local function finishClearedCombatCamp()
-    local point, humanoid = patrol.combatCamp, patrol.combatHumanoid
-    -- Disappearance/timeout is not proof of a kill.
-    if not point or not humanoid or humanoid.Health > 0 then return end
-    for model in pairs(mobs) do
-        local h, r = livingNPC(model)
-        if h and isMagnetized(model, h)
-            and (r.Position - point.position).Magnitude <= point.radius
-            and math.abs(r.Position.Y - point.position.Y) <= config.CampHeightTolerance then return end
-    end
-    point.visited, point.retryAt = patrol.pass, 0
-    if patrol.current == point then
-        patrol.current, patrol.arrived, patrol.started, patrol.seenAt = nil, nil, nil, nil
-    end
-    log("PATROL", "Da danh het Magnetized dang hien dien: bo qua bai " .. point.name .. " trong vong nay")
-end
-local function farmStep(dt)
-    if not enabled then return end
-    -- [FIX 4] Nhường random token nếu đang trong lúc Purchase
-    if randomToken.busy and randomToken.status == "Quay 500 Magnet Token" then return end
-    if not eventStillOpen() then
-        if target then resetTarget("het event; chuyen sang Fruit") end
-        restoreBring()
-        if action.kind == "hop" and not hop.startup and not hop.dispatched then cancelAction("het event; dung tim server") end
-        if action.kind == "portal" and (portal.forCombat or not fruitTask.target) then
-            cancelAction("het event; chuyen sang Fruit")
-        end
-    end
-    local now = os.clock()
-    if not teamSelectionStep(now) then
-        releaseMovement()
-        status = teamSelect.lastResult
-        return
-    end
-    local character = player.Character
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = rootOf(character)
-    if not humanoid or humanoid.Health <= 0 or not root then
-        resetTarget(); status = "Cho respawn..."; return
-    end
-    if not character:FindFirstChild("HasBuso") then
-        releaseMovement()
-        if action.kind and not hop.dispatched then cancelAction("cho Haki bat buoc") end
-        status = "Cho bat Haki Buso bat buoc; chua xac nhan HasBuso"
-        return
-    end
-    hop.readyAt = hop.readyAt or (now + config.StartupDelay)
-    if recoverFromSeat(root, humanoid, now) then return end
-    if not hop.checked and not hop.blocked and not action.kind then
-        if now < hop.readyAt then
-            releaseMovement()
-            status = "Cho kiem tra server dau phien " .. math.ceil(hop.readyAt - now) .. "s"
-            return
-        elseif #Players:GetPlayers() <= config.CurrentPlayerLimit then
-            hop.checked, hop.status = true, "Server trong gioi han " .. config.CurrentPlayerLimit .. " nguoi"
-        elseif hasMythicalFruit() then
-            hop.status = "Chan hop dau phien: con Mythical chua luu"
-            -- Continue into storage/farming while retaining the startup check.
-        elseif now >= hop.retryAt then
-            startHop(true)
-            status = hop.status
-            return
-        end
-    end
-
-    if config.EventScheduleEnabled and not eventWindow.active and action.kind == "portal"
-        and not portal.forCombat and not fruitTask.target then
-        cancelAction("het gio event; dung Portal tuan tra")
-    end
-    if hasLiveMagnetized() and action.kind and not hop.dispatched
-        and not (action.kind == "hop" and hop.startup)
-        and not (action.kind == "portal" and portal.forCombat) then
-        cancelAction("nhuong Magnetized")
-    end
-    if action.kind then
-        status = action.kind == "portal" and ("Dang mo Portal: " .. tostring(portal.destination))
-            or action.kind == "hop" and hop.status
-            or action.kind == "store" and "Dang xac nhan luu Fruit"
-            or "Dang xac nhan nhat Fruit"
-        return
-    end
-    local mobHumanoid, mobRoot = livingNPC(target)
-    if target and (not mobHumanoid or not isMagnetized(target, mobHumanoid)) then
-        finishClearedCombatCamp()
-        resetTarget("chet / mat muc tieu / het Magnetized (khong xac nhan reward)")
-        mobHumanoid, mobRoot = nil, nil
-    end
-    if not target then
-        -- Sea 1 remains island-scoped. Sea 2/3 may acquire any replicated
-        -- Magnetized target and always preempt every lower-priority task.
-        local nearest = math.huge
-        if eventWindow.active and (not islandMode or patrol.current) then
-            for _, model in ipairs(targets) do
-                local h, r = livingNPC(model)
-                local onCurrentIsland = not islandMode or (r and patrol.current
-                    and islandAt(r.Position) == patrol.current.name)
-                if h and onCurrentIsland and isMagnetized(model, h) and (skipped[model] or 0) <= now then
-                    local distance = (r.Position - root.Position).Magnitude
-                    if distance < nearest then target, nearest = model, distance end
-                end
-            end
-        end
-        if not target then
-            local owned, blocked, waiting = getStoreSummary()
-            if #owned > 0 and config.StoreFruit then
-                for _, item in ipairs(owned) do
-                    if startStore(item, false) then
-                        status = "Dang luu " .. short(item.Name, 60)
-                        return
-                    end
-                end
-            end
-
-
-            -- Rejected Tools stay in the bag but must not block the next pickup.
-            -- A new/unresolved Tool still waits for its store attempt. Holding a
-            -- rejected Tool also prevents hop, so allow pickup before hop.checked.
-            local pendingStore = #owned - blocked
-            if pendingStore == 0 and (hop.checked or hop.blocked or blocked > 0)
-                and not eventWindow.active and fruitStep(root, humanoid, dt, now) then return end
-            if config.EventScheduleEnabled and not eventWindow.active then
-                releaseMovement()
-                status = "Ngoai event: cho Fruit | event sau " .. math.ceil(eventWindow.remaining) .. "s"
-                return
-            end
-            patrolStep(root, humanoid, dt, now)
-            return
-        end
-        patrol.arrived, patrol.started, patrol.best = nil, nil, math.huge
-        patrol.seenAt = nil
-        mobHumanoid, mobRoot = livingNPC(target)
-        patrol.combatCamp, patrol.combatHumanoid = combatCampAt(mobRoot.Position), mobHumanoid
-        targetSince, lastDamage, lastProgress = now, now, now
-        lastHP, bestDistance, attackSince = mobHumanoid.Health, math.huge, nil
-        log("FARM", "Chon " .. target.Name)
-    end
-    if now - targetSince > config.TargetTimeout then
-        resetTarget("timeout; tam bo qua", true); return
-    end
-    local distance = (mobRoot.Position - root.Position).Magnitude
-    if mobHumanoid.Health < lastHP then lastDamage = now end
-    lastHP = mobHumanoid.Health
-    if distance < bestDistance - 2 then bestDistance, lastProgress = distance, now end
-    if distance > config.AttackRange then
-        attackSince = nil
-        if now - lastProgress > config.NoProgressTimeout then
-            resetTarget("di chuyen khong tien trien; tam bo qua", true); return
-        end
-    else
-        lastProgress, bestDistance = now, distance
-        if not attackSince then attackSince, lastDamage = now, now end
-        if now - lastDamage > config.NoDamageTimeout then
-            resetTarget("HP khong giam; kiem tra vu khi/combat/server", true); return
-        end
-    end
-    local destination = mobRoot.Position + Vector3.new(0, config.HoverHeight, 2)
-    if distance > config.AttackRange
-        and tryStartPortal(mobRoot.Position, root, humanoid, true) then
-        status = "Portal den Magnetized " .. short(target.Name, 45)
-        return
-    end
-    flyTo(root, humanoid, destination, dt, mobRoot.Position)
-    bringEventMobs(root, mobRoot, now)
-    status = "Farm " .. short(target.Name, 65) .. " | HP " .. math.ceil(mobHumanoid.Health)
-    attackClock = attackClock + dt
-    if distance <= config.AttackRange and attackClock >= config.AttackInterval then
-        attackClock = 0
-        local tool, equipDetail = equip(character, humanoid)
-        if tool then
-            local sent, detail = attack(mobRoot, tool)
-            if not sent then status = detail end
-        else status = equipDetail or "Cho vu khi san sang" end
-    end
-end
-
--- Mặt đứng trên nước lấy từ cơ chế đã test; luôn hoạt động trong suốt phiên,
--- kể cả lúc bay, mở Portal hoặc tạm dừng farm. Chỉ Destroy mới dọn platform.
-local waterPlatform
-local staleWaterPlatform = workspace:FindFirstChild("EventMagnetWaterPlatform")
-if staleWaterPlatform and staleWaterPlatform:IsA("BasePart") then
-    pcall(function() staleWaterPlatform:Destroy() end)
-end
-local function updateWaterWalk()
-    if waterPlatform then waterPlatform.CanCollide = false end
-    if not alive or not config.WaterWalkEnabled then return end
-    local character = player.Character
-    local root = rootOf(character)
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if not root or not humanoid or humanoid.Health <= 0 or humanoid.Sit then return end
-
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = waterPlatform and { character, waterPlatform } or { character }
-    params.IgnoreWater = false
-    local hit = workspace:Raycast(
-        root.Position + Vector3.new(0, 5, 0),
-        Vector3.new(0, -140, 0),
-        params
-    )
-    local surface = config.WaterWalkSurfaceY
-    local hitName = hit and string.lower(hit.Instance.Name) or ""
-    local nearWaterLevel = root.Position.Y >= surface - 15 and root.Position.Y <= surface + 12.5
-    if nearWaterLevel then
-        -- Fixed-level support from Auto Factory, even if a mob/prop blocks the ray.
-        surface = config.WaterWalkSurfaceY
-    elseif hit and (hit.Material == Enum.Material.Water or hitName == "sea"
-        or hitName:find("water", 1, true) or hitName:find("ocean", 1, true)) then
-        surface = hit.Position.Y
-    elseif hit and hit.Position.Y > surface - 8 then
-        return
-    end
-    if root.Position.Y > surface + 70 or root.Position.Y < surface - 15 then return end
-
-    if not waterPlatform then
-        waterPlatform = Instance.new("Part")
-        waterPlatform.Name = "EventMagnetWaterPlatform"
-        waterPlatform.Size = Vector3.new(32, 1, 32)
-        waterPlatform.Anchored = true
-        waterPlatform.Transparency = 1
-        waterPlatform.CanTouch = false
-        waterPlatform.CanQuery = false
-        waterPlatform.CastShadow = false
-        waterPlatform.Parent = workspace
-    end
-    waterPlatform.CFrame = CFrame.new(root.Position.X, surface - 0.5, root.Position.Z)
-    waterPlatform.CanCollide = true
-end
-connect(RunService.Stepped, function()
-    local ok, err = pcall(updateWaterWalk)
-    if not ok then
-        if waterPlatform then waterPlatform.CanCollide = false end
-        if os.clock() - lastError > 5 then
-            lastError = os.clock()
-            log("WATER", short(err, 100))
-        end
-    end
-end)
-
--- A separate function avoids combining farm and dashboard locals in Luau.
-local function mountDashboard()
-local gui = Instance.new("ScreenGui")
-gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "EventMagnetFarmUI", false, 1000
-gui.IgnoreGuiInset = true
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-local function tryMountGui(parent)
-    if not parent then return false end
-    local ok = pcall(function()
-        local stale = parent:FindFirstChild(gui.Name)
-        if stale and stale ~= gui then stale:Destroy() end
-        gui.Parent = parent
-    end)
-    return ok and gui.Parent == parent
-end
-local mounted = false
-if type(gethui) == "function" then
-    local ok, hiddenUi = pcall(gethui)
-    if ok then mounted = tryMountGui(hiddenUi) end
-end
-if not mounted then
-    local ok, coreGui = pcall(function() return game:GetService("CoreGui") end)
-    if ok then mounted = tryMountGui(coreGui) end
-end
-if not mounted then
-    local playerGui = player:FindFirstChildOfClass("PlayerGui")
-        or player:WaitForChild("PlayerGui", 15)
-    mounted = tryMountGui(playerGui)
-end
-if not mounted then
-    gui:Destroy()
-    error("Khong the hien EventMagnetFarmUI qua gethui/CoreGui/PlayerGui")
-end
-local UIS = game:GetService("UserInputService")
-local C = {
-    bg = Color3.fromRGB(3, 20, 35), card = Color3.fromRGB(4, 28, 47),
-    cyan = Color3.fromRGB(0, 218, 255), line = Color3.fromRGB(12, 89, 125),
-    text = Color3.fromRGB(228, 243, 255), muted = Color3.fromRGB(142, 188, 224),
-    green = Color3.fromRGB(0, 241, 130), yellow = Color3.fromRGB(255, 207, 0),
-    red = Color3.fromRGB(225, 15, 62), button = Color3.fromRGB(5, 43, 81),
-}
-local panel = Instance.new("Frame")
-panel.Name, panel.Size = "MagnetDashboard", UDim2.fromOffset(560, 680)
-panel.AnchorPoint, panel.Position = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5)
-panel.BackgroundColor3, panel.BorderSizePixel = C.bg, 0
-panel.Active, panel.ClipsDescendants, panel.Parent = true, true, gui
-local scale = Instance.new("UIScale")
-scale.Parent = panel
-local function rounded(parent, radius, color, thickness)
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius, corner.Parent = UDim.new(0, radius), parent
-    if color then
-        local outline = Instance.new("UIStroke")
-        outline.Color, outline.Thickness, outline.Parent = color, thickness or 1, parent
-    end
-end
-rounded(panel, 16, C.cyan, 2)
-local function text(parent, value, x, y, w, h, size, color, bold)
-    local label = Instance.new("TextLabel")
-    label.Position, label.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
-    label.Text, label.TextSize = value, size or 16
-    label.TextColor3, label.BackgroundTransparency = color or C.text, 1
-    label.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
-    label.TextWrapped, label.TextXAlignment = true, Enum.TextXAlignment.Left
-    label.Parent = parent
-    return label
-end
-local function card(parent, x, y, w, h)
-    local frame = Instance.new("Frame")
-    frame.Position, frame.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
-    frame.BackgroundColor3, frame.BorderSizePixel, frame.Parent = C.card, 0, parent
-    rounded(frame, 10, C.line, 1)
-    return frame
-end
-local function button(parent, label, x, y, w, h, color)
-    local item = Instance.new("TextButton")
-    item.Position, item.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
-    item.Text, item.Font, item.TextSize = label, Enum.Font.GothamBold, 18
-    item.BackgroundColor3, item.TextColor3 = color or C.button, C.text
-    item.BorderSizePixel, item.Parent = 0, parent
-    rounded(item, 9, C.cyan, 1)
-    return item
-end
-local header = Instance.new("Frame")
-header.Name, header.Size, header.BackgroundTransparency = "DragHandle", UDim2.new(1, 0, 0, 54), 1
-header.Active, header.Parent = true, panel
-local titleLabel = text(header, "MAGNETIZED FARM V2", 20, 9, 370, 34, 24, C.text, true)
-local onLabel = text(header, "● ON", 405, 10, 68, 32, 20, C.green, true)
-local minimize = button(header, "−", 476, 10, 32, 32)
-local topClose = button(header, "×", 516, 10, 32, 32)
-local body = Instance.new("Frame")
-body.Name, body.Size, body.BackgroundTransparency = "DashboardBody", UDim2.fromScale(1, 1), 1
-body.Parent = panel
--- Keep header above the transparent body so drag/minimize/close remain clickable.
-header.ZIndex = 3
-for _, child in ipairs(header:GetChildren()) do if child:IsA("GuiObject") then child.ZIndex = 4 end end
-local refs = {}
-text(body, "●  USER", 22, 64, 102, 25, 15, C.muted, true)
-text(body, "@" .. player.Name, 128, 62, 406, 29, 19, C.text, true)
-local teamCard = card(body, 18, 108, 169, 76)
-text(teamCard, "♟ TEAM", 12, 8, 145, 20, 13, C.muted, true)
-refs.team = text(teamCard, "-", 12, 31, 145, 34, 20, C.text, true)
-local eventCard = card(body, 195, 108, 169, 76)
-text(eventCard, "◷ EVENT", 12, 8, 145, 20, 13, C.muted, true)
-refs.event = text(eventCard, "-", 12, 31, 145, 34, 16, C.yellow, true)
-local campCard = card(body, 372, 108, 170, 76)
-text(campCard, "⌖ VÒNG / BÃI", 12, 8, 146, 20, 13, C.muted, true)
-refs.camp = text(campCard, "-", 12, 31, 146, 34, 21, C.text, true)
-local counts = card(body, 18, 196, 524, 112)
-local function counter(label, x, y)
-    text(counts, label, x, y, 136, 25, 16, C.muted, false)
-    local value = text(counts, "0", x + 138, y, 90, 25, 17, C.text, true)
-    value.TextXAlignment = Enum.TextXAlignment.Right
-    return value
-end
-refs.magnet = counter("Magnetized", 14, 10)
-refs.owned = counter("Giữ", 14, 43)
-refs.auto = counter("Auto token", 14, 76)
-refs.events = counter("Event", 280, 10)
-refs.fruits = counter("Fruit map", 280, 43)
-refs.blocked = counter("Chờ/chặn", 280, 76)
-local system = card(body, 18, 320, 524, 112)
-text(system, "⚙  HỆ THỐNG", 14, 8, 490, 26, 17, C.muted, true)
-text(system, "Portal", 14, 36, 110, 22, 15, C.muted)
-refs.portal = text(system, "-", 130, 36, 380, 22, 14)
-text(system, "Hop", 14, 60, 110, 22, 15, C.muted)
-refs.hop = text(system, "-", 130, 60, 380, 22, 14)
-text(system, "Webhook", 14, 84, 110, 22, 15, C.muted)
-refs.webhook = text(system, "-", 130, 84, 380, 22, 14)
-local stateCard = card(body, 18, 444, 524, 112)
-text(stateCard, "⌁  TRẠNG THÁI", 14, 6, 490, 25, 17, C.cyan, true)
-local targetLabel = text(stateCard, "Đang khởi động...", 14, 34, 496, 40, 17, C.cyan, true)
-refs.random = text(stateCard, "-", 14, 77, 496, 25, 12, C.muted)
-local toggle = button(body, "■  DỪNG FARM", 18, 568, 256, 52, C.red)
-local close = button(body, "⇥  THOÁT", 286, 568, 256, 52, C.button)
-local footer = text(body, "Hoàng Trọng DEV", 18, 637, 524, 27, 20, C.cyan)
-footer.TextXAlignment = Enum.TextXAlignment.Center
-local collapsed, dragging, dragInput, dragStart, startPosition = false, false, nil, nil, nil
-local cameraConnection
-local function viewport()
-    return workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
-end
-local function fitPanel()
-    local size = viewport()
-    if size.X < 40 or size.Y < 40 then return end
-    -- Same scale in expanded/collapsed states prevents position jumps on reopening.
-    scale.Scale = math.min(1, (size.X - 24) / 560, (size.Y - 24) / 680)
-    local half = Vector2.new(560, collapsed and 54 or 680) * scale.Scale / 2
-    local x = panel.Position.X.Scale * size.X + panel.Position.X.Offset
-    local y = panel.Position.Y.Scale * size.Y + panel.Position.Y.Offset
-    panel.Position = UDim2.fromOffset(
-        math.clamp(x, half.X + 8, size.X - half.X - 8),
-        math.clamp(y, half.Y + 8, size.Y - half.Y - 8))
-end
-connect(minimize.Activated, function()
-    collapsed = not collapsed
-    body.Visible = not collapsed
-    panel.Size = UDim2.fromOffset(560, collapsed and 54 or 680)
-    minimize.Text = collapsed and "+" or "−"
-    titleLabel.Text = collapsed and ("MAGNETIZED FARM V2 | @" .. player.Name) or "MAGNETIZED FARM V2"
-    titleLabel.TextSize = collapsed and 15 or 24
-    fitPanel()
-end)
-local function bindCamera()
-    if cameraConnection then cameraConnection:Disconnect() end
-    local camera = workspace.CurrentCamera
-    if camera then cameraConnection = connect(camera:GetPropertyChangedSignal("ViewportSize"), fitPanel) end
-    fitPanel()
-end
-connect(workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
-bindCamera()
-connect(header.InputBegan, function(input)
-    local kind = input.UserInputType
-    if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.Touch then return end
-    if input.Position.X >= minimize.AbsolutePosition.X then return end
-    dragging, dragInput, dragStart, startPosition = true, input, input.Position, panel.Position
-end)
-connect(UIS.InputChanged, function(input)
-    if not dragging or not dragStart then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input ~= dragInput then return end
-    local delta = input.Position - dragStart
-    panel.Position = UDim2.fromOffset(startPosition.X.Offset + delta.X, startPosition.Y.Offset + delta.Y)
-    fitPanel()
-end)
-connect(UIS.InputEnded, function(input)
-    if input == dragInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging, dragInput, dragStart, startPosition = false, nil, nil, nil
-    end
-end)
-local function renderDashboard()
-    toggle.Text = enabled and "■  DỪNG FARM" or "▶  BẬT FARM"
-    toggle.BackgroundColor3 = enabled and C.red or C.button
-    onLabel.Text, onLabel.TextColor3 = enabled and "● ON" or "● OFF", enabled and C.green or C.muted
-    local visited = 0
-    for _, point in ipairs(patrol.points) do if point.visited == patrol.pass then visited = visited + 1 end end
-    local owned, blocked, waiting = getStoreSummary()
-    local fruitCount = 0
-    for _ in pairs(fruitRecords) do fruitCount = fruitCount + 1 end
-    refs.team.Text = tostring(currentTeamName() or "Chờ chọn team")
-    refs.event.Text = config.EventScheduleEnabled and ((eventWindow.active and "ĐANG MỞ " or "TIẾP THEO ")
-        .. string.format("%02d:%02d", math.floor(eventWindow.remaining / 60), math.floor(eventWindow.remaining % 60))) or "LỊCH TẮT"
-    refs.camp.Text = patrol.pass .. " • " .. visited .. "/" .. #patrol.points
-    refs.magnet.Text, refs.owned.Text = tostring(#targets), tostring(#owned)
-    refs.events.Text, refs.fruits.Text = tostring(eventCount), tostring(fruitCount)
-    refs.blocked.Text = waiting .. "/" .. blocked
-    refs.auto.Text = randomToken.locked and "LỖI" or (config.AutoRandomToken and "ON" or "OFF")
-    refs.auto.TextColor3 = randomToken.locked and C.red or (config.AutoRandomToken and C.green or C.muted)
-    refs.portal.Text = short(portal.lastResult, 65)
-    refs.hop.Text = short(hop.status, 65)
-    local url = tostring(env.WebhookURL or config.WebhookURL or "")
-    refs.webhook.Text = config.WebhookEnabled and url:match("^https://")
-        and ("ON • " .. tostring(env.WebhookMinRarity or config.WebhookMinRarity)) or "OFF"
-    targetLabel.Text = short(status, 150)
-    refs.random.Text = "Token: " .. short(randomToken.status, 95)
-end
-renderDashboard()
-function api.Destroy()
-    if not alive then return end
-    if waterPlatform then waterPlatform:Destroy(); waterPlatform = nil end
-    cancelAction("Destroy")
-    alive, enabled = false, false
-    restoreBring()
-    restoreSeatGuard()
-    resetTarget()
-    for _, connection in ipairs(connections) do connection:Disconnect() end
-    for _, record in pairs(remotes) do
-        if record.connection then record.connection:Disconnect() end
-        record.rename:Disconnect(); record.destroy:Disconnect()
-    end
-    remotes, mobs, targets = {}, {}, {}
-    local fruitInstances = {}
-    for instance in pairs(fruitRecords) do table.insert(fruitInstances, instance) end
-    for _, instance in ipairs(fruitInstances) do removeFruitRecord(instance) end
-    gui:Destroy()
-    if env.EventMagnetFarm == api then env.EventMagnetFarm = nil end
-end
-connect(toggle.Activated, function() api.SetEnabled(not enabled) end)
-connect(close.Activated, api.Destroy)
-connect(topClose.Activated, api.Destroy)
-connect(player.CharacterRemoving, function()
-    cancelAction("CharacterRemoving"); resetTarget(); hop.readyAt = nil; status = "Cho respawn..."
-end)
-connect(player.CharacterAdded, function()
-    cancelAction("CharacterAdded"); resetTarget(); scanClock = config.ScanInterval
-end)
-connect(RunService.Stepped, function()
-    if not enabled or not target or action.kind then restoreBring() end
-    local ok, err = pcall(updateSeatGuard)
-    if not ok and os.clock() - lastError > 5 then
-        lastError = os.clock(); log("SEAT", short(err, 100))
-    end
-    if not moveRoot or not enabled then return end
-    local character = player.Character
-    if not character then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") then
-            if collisionState[part] == nil then collisionState[part] = part.CanCollide end
-            part.CanCollide = false
-        end
-    end
-end)
-connect(RunService.Heartbeat, function(dt)
-    local ok, err = pcall(function()
-        scanClock, uiClock = scanClock + dt, uiClock + dt
-        fruitScanClock, fruitESPClock = fruitScanClock + dt, fruitESPClock + dt
-        patrol.refresh = patrol.refresh + dt
-        if patrol.refresh >= 5 then patrol.refresh = 0; refreshSpawnPoints() end
-        if scanClock >= config.ScanInterval then scanClock = 0; scanMobs() end
-        if fruitScanClock >= config.FruitScanInterval then fruitScanClock = 0; refreshFruits() end
-        if fruitESPClock >= config.FruitESPUpdateInterval then
-            fruitESPClock = 0
-            updateFruitESP(rootOf(player.Character))
-        end
-        updateEventWindow()
-        farmStep(dt)
-        randomTokenStep()
-        if uiClock >= 0.3 then
-            uiClock = 0
-            renderDashboard()
-        end
-    end)
-    if not ok then
-        api.SetEnabled(false)
-        status = "Loi: da dung farm. Xem GetLogs()."
-        targetLabel.Text = status
-        if os.clock() - lastError > 5 then lastError = os.clock(); log("ERROR", err) end
-    end
-end)
--- Same 30-second interval as the supplied code (its 90-second comment was stale).
-task.spawn(function()
-    task.wait(2)
-    while alive and sessionSerial == env.__EventMagnetSessionSerial do
-        if enabled and config.HopApiUrl ~= "" and game.JobId ~= "" then
-            -- Only this coroutine sends heartbeats: a hanging HTTP request cannot
-            -- spawn another one, and a stopped/rerun session exits afterwards.
-            pcall(function()
-                workerRequest("/api/heartbeat", {
-                    username = player.Name, jobId = game.JobId, placeId = tostring(game.PlaceId),
-                })
-            end)
-        end
-        task.wait(config.HopHeartbeatInterval)
-    end
-end)
-end -- dashboard function
-mountDashboard()
-log("INFO", "Chi quan sat event client; khong xac nhan reward hoac event rieng server")
-return api
-
-
-]====]
-env.__EventMagnetV2Source = source
-local run, err = loadstring(source)
-assert(run, err)
-return run()
