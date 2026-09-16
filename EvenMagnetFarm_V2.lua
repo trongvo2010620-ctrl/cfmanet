@@ -71,7 +71,11 @@ local config = {
     FruitScanInterval = 1, FruitPickupDistance = 6, FruitPickupConfirm = 2,
     FruitPickupAttempts = 3, FruitRetryDelay = 60,
     StoreFruit = true, StoreRetryDelay = 15, StoreAttempts = 3,
-    AutoRandomToken = true, WebhookURL = "",
+    AutoRandomToken = true,
+    RandomCheckIdle = 30,
+    RandomCheckCooldown = 5,
+    RandomFallbackCooldown = 60,
+    WebhookURL = "",
     WebhookEnabled = true, WebhookOnPickup = true, WebhookOnRandom = true, WebhookOnStore = true,
     WebhookMinRarity = "Legendary", WebhookUsername = "Noti Fruit", WebhookTitle = "Noti Fruit",
     WebhookFooterText = "Hoàng Trọng DEV", WebhookColor = 16776960,
@@ -343,6 +347,9 @@ config.HopHeartbeatInterval = math.max(30, config.HopHeartbeatInterval)
 config.HopCandidates = math.clamp(math.floor(config.HopCandidates), 1, 10)
 config.HopRequestRetries = math.clamp(math.floor(config.HopRequestRetries), 1, 5)
 config.EventDurationSeconds = math.clamp(config.EventDurationSeconds, 1, 3600)
+config.RandomCheckIdle = math.max(5, math.floor(config.RandomCheckIdle))
+config.RandomCheckCooldown = math.max(1, math.floor(config.RandomCheckCooldown))
+config.RandomFallbackCooldown = math.max(5, math.floor(config.RandomFallbackCooldown))
 do
     local wanted = string.lower(tostring(config.Team or "Marines"))
     config.Team = (wanted == "pirate" or wanted == "pirates") and "Pirates" or "Marines"
@@ -371,8 +378,14 @@ local fruitRecords = setmetatable({}, { __mode = "k" })
 local storeRecords = setmetatable({}, { __mode = "k" })
 local fruitTask = { target = nil, started = nil, best = math.huge, progress = 0 }
 local hop = { busy = false, retryAt = 0, status = "Cho kiem tra dau phien" }
+-- [FIX 1] Random token: tự dò cooldown qua Check, không phụ thuộc event window
 local randomToken = { busy = false, locked = false, retryAt = 0, serial = 0,
-    status = "Tu quay khi du 500 token" }
+    status = "Cho kiem tra cooldown",
+    nextCheck = 0,
+    tokenNow = 0,
+    tokenNeed = 500,
+    cooldownLeft = 0,
+    requirementMet = false }
 if type(env.WebhookURL) == "string" then config.WebhookURL = env.WebhookURL end
 config.EventScheduleEnabled, config.EventDurationSeconds, config.StartupHop = true, 600, true
 config.HopMaxPlayers = math.min(config.HopMaxPlayers, config.TargetExistingPlayers)
@@ -1790,8 +1803,7 @@ local function addPatrolPoint(name, position, source)
     if typeof(position) ~= "Vector3" then return false end
     for _, coordinate in ipairs({position.X, position.Y, position.Z}) do
         if coordinate ~= coordinate or math.abs(coordinate) == math.huge then return false end
-    end
-    -- Strip level/event suffixes so every Mercenary spawn belongs to its camp.
+    end    -- Strip level/event suffixes so every Mercenary spawn belongs to its camp.
     local mobKey = string.lower(tostring(name)):gsub("%b[]", "")
         :gsub("magnetized", ""):gsub("%s+", " "):match("^%s*(.-)%s*$")
     if islandMode then
@@ -1854,6 +1866,9 @@ function api.GetState()
         portal = portal.lastResult, portalDestination = portal.destination,
         hopChecked = hop.checked, hopBusy = hop.busy, hopStatus = hop.status,
         playerCount = #Players:GetPlayers(), session = sessionSerial,
+        randomStatus = randomToken.status,
+        randomToken = randomToken.tokenNow,
+        randomCooldown = randomToken.cooldownLeft,
     }
 end
 for _, row in ipairs(seedRoutes[sea] or {}) do addPatrolPoint(row[1], row[2], "local database") end
@@ -2213,37 +2228,50 @@ local function fruitStep(root, humanoid, dt, now)
     return true
 end
 
--- Check/Purchase schema verified from the user's MagnetRandomTest output.
+-- [FIX 3] Random Token: tự dò cooldown + token qua Check, không phụ thuộc event window.
+-- State: idle -> check -> (chờ token / chờ cooldown / đủ điều kiện) -> Purchase -> check lại
 local function randomTokenStep()
-    if not alive or not enabled or not config.AutoRandomToken or randomToken.locked
-        or randomToken.busy or action.kind or not eventStillOpen()
-        or hasLiveMagnetized() or os.clock() < randomToken.retryAt then return end
+    if not alive or not enabled or not config.AutoRandomToken then return end
+    if randomToken.locked or randomToken.busy or action.kind then return end
+
+    local now = os.clock()
+    if now < randomToken.nextCheck then return end
+
     local character = player.Character
     local hum = character and character:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 or not currentTeamName()
         or not character:FindFirstChild("HasBuso") then return end
+
+    -- Nhường việc ưu tiên cao hơn (store đang chờ)
     local owned, blocked = getStoreSummary()
     if #owned > blocked then return end
+
     local modules = RS:FindFirstChild("Modules")
     local net = modules and modules:FindFirstChild("Net")
     local rf = net and net:FindFirstChild("RF/GachaNetworkRF")
     if not rf or not rf:IsA("RemoteFunction") then
-        randomToken.retryAt = os.clock() + 5; return
+        randomToken.nextCheck = now + 5
+        randomToken.status = "Chua tim thay GachaNetworkRF"
+        return
     end
+
     randomToken.busy = true
     randomToken.serial = randomToken.serial + 1
     local serial = randomToken.serial
     local function current()
         return alive and env.EventMagnetFarm == api and randomToken.serial == serial
     end
-    task.delay(12, function()
+    -- Timeout an toàn: nếu request treo quá 20s thì mở khoá
+    task.delay(20, function()
         if current() and randomToken.busy then
             randomToken.locked, randomToken.status = true, "Timeout: khoa random, cho ket qua"
         end
     end)
+
     task.spawn(function()
         local dispatched = false
-        local ok = pcall(function()
+        local ok, err = pcall(function()
+            -- ===== BƯỚC 1: CHECK =====
             local a, b = rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
             if not current() then return end
             local req = type(b) == "table" and b or (type(a) == "table" and a)
@@ -2254,32 +2282,74 @@ local function randomTokenStep()
                 randomToken.locked, randomToken.status = true, "Du lieu/gia thay doi: dung random"
                 return
             end
-            if price.Current < 500 or price.RequirementMet ~= true then
-                randomToken.status, randomToken.retryAt = "Token " .. price.Current .. "/500", os.clock() + 10
+
+            randomToken.tokenNow = tonumber(price.Current) or 0
+            randomToken.tokenNeed = tonumber(price.Value) or 500
+            randomToken.requirementMet = req.RequirementsMet == true
+
+            -- ===== BƯỚC 2: ĐỌC COOLDOWN =====
+            local cooldown = req.Cooldown
+            local cdLeft = 0
+            local cooldownBlocked = false
+            if type(cooldown) == "table" then
+                cdLeft = tonumber(cooldown.TimeLeft) or tonumber(cooldown.Remaining)
+                    or tonumber(cooldown.Duration) or 0
+                if type(cooldown.RequirementMet) == "boolean"
+                    and cooldown.RequirementMet == false and cdLeft <= 0 then
+                    cdLeft = config.RandomFallbackCooldown
+                    cooldownBlocked = true
+                end
+            end
+            randomToken.cooldownLeft = math.max(cdLeft, 0)
+
+            -- ===== BƯỚC 3: QUYẾT ĐỊNH =====
+            local tokenReady = randomToken.tokenNow >= randomToken.tokenNeed
+            local cooldownReady = randomToken.cooldownLeft <= 0 and not cooldownBlocked
+
+            if not tokenReady then
+                randomToken.nextCheck = os.clock() + config.RandomCheckIdle
+                randomToken.status = string.format("Token %d/%d (cho %ds)",
+                    randomToken.tokenNow, randomToken.tokenNeed, config.RandomCheckIdle)
                 return
             end
-            if req.RequirementsMet ~= true or (type(req.Cooldown) == "table" and req.Cooldown.RequirementMet == false) then
-                randomToken.status, randomToken.retryAt = "Cho cooldown/dieu kien", os.clock() + 3
+            if not randomToken.requirementMet then
+                randomToken.nextCheck = os.clock() + 10
+                randomToken.status = "Chua du dieu kien event"
                 return
             end
-            if not enabled or not config.AutoRandomToken or randomToken.locked or not eventStillOpen()
-                or action.kind or hasLiveMagnetized() or player.Character ~= character or hum.Health <= 0 then return end
+            if not cooldownReady then
+                local wait = math.max(randomToken.cooldownLeft, 1) + config.RandomCheckCooldown
+                randomToken.nextCheck = os.clock() + wait
+                randomToken.status = string.format("Cooldown %ds (token %d/%d)",
+                    math.ceil(randomToken.cooldownLeft),
+                    randomToken.tokenNow, randomToken.tokenNeed)
+                return
+            end
+
+            -- ===== BƯỚC 4: PURCHASE =====
+            if not current() or not enabled or randomToken.locked then return end
+            if player.Character ~= character or hum.Health <= 0 then return end
             if not character:FindFirstChild("HasBuso") then return end
+
             local before = {}
             for _, item in ipairs(ownedFruitTools()) do before[item] = true end
+
             dispatched = true
             randomToken.status = "Quay 500 Magnet Token"
-            local accepted, details = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
+            local accepted = rf:InvokeServer({Context = "Purchase", BoxName = "MagnetEventGacha26"})
             if not current() then return end
+
             if accepted == false then
-                randomToken.status, randomToken.retryAt = "Server tu choi; Check lai", os.clock() + 3
+                randomToken.nextCheck = os.clock() + 5
+                randomToken.status = "Server tu choi; Check lai sau 5s"
                 return
             elseif accepted ~= true then
                 randomToken.locked, randomToken.status = true, "Purchase chua ro; dung random"
                 return
             end
+
+            -- Chờ Tool mới xuất hiện
             local rewards = {}
-            -- auto_factory waits for a real reward Tool; don't invent a fruit from Purchase=true.
             local rewardDeadline = os.clock() + 8
             repeat
                 task.wait(0.1)
@@ -2289,19 +2359,50 @@ local function randomTokenStep()
                     if not before[item] then rewards[#rewards + 1] = item.Name end
                 end
             until #rewards > 0 or os.clock() >= rewardDeadline
+
             randomToken.status = #rewards > 0 and ("Nhan " .. table.concat(rewards, ", "))
                 or "Server chap nhan; chua thay Fruit"
             log("RANDOM", randomToken.status)
             for _, item in ipairs(ownedFruitTools()) do
-                if not before[item] then sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item)) end
+                if not before[item] then
+                    sendFruitWebhook("Random", item.Name, item, getFruitOriginalName(item))
+                end
             end
-            randomToken.retryAt = os.clock() + (#rewards > 0 and 3 or 30)
+
+            -- ===== BƯỚC 5: ĐỌC LẠI COOLDOWN MỚI =====
+            task.wait(1)
+            if not current() then return end
+            local ok2, a2, b2 = pcall(function()
+                return rf:InvokeServer({Context = "Check", BoxName = "MagnetEventGacha26"})
+            end)
+            if ok2 and current() then
+                local req2 = type(b2) == "table" and b2 or (type(a2) == "table" and a2)
+                if req2 and type(req2.Cooldown) == "table" then
+                    local cd2 = tonumber(req2.Cooldown.TimeLeft)
+                        or tonumber(req2.Cooldown.Remaining)
+                        or tonumber(req2.Cooldown.Duration) or 0
+                    randomToken.cooldownLeft = math.max(cd2, 0)
+                else
+                    randomToken.cooldownLeft = config.RandomFallbackCooldown
+                end
+                randomToken.tokenNow = req2 and req2.Price
+                    and tonumber(req2.Price.Current) or 0
+                randomToken.nextCheck = os.clock()
+                    + math.max(randomToken.cooldownLeft, 1) + config.RandomCheckCooldown
+                randomToken.status = string.format("Cooldown moi %ds; token %d/%d",
+                    math.ceil(randomToken.cooldownLeft),
+                    randomToken.tokenNow, randomToken.tokenNeed)
+            else
+                randomToken.nextCheck = os.clock() + 30
+                randomToken.status = "Da quay; cho check lai cooldown"
+            end
         end)
+
         if not current() then return end
         if not ok then
-            randomToken.locked = dispatched or randomToken.locked
-            randomToken.status = dispatched and "Purchase loi; khoa random" or "Check loi; thu lai sau"
-            randomToken.retryAt = os.clock() + 10
+            log("RANDOM", "Loi: " .. short(err, 120))
+            randomToken.nextCheck = os.clock() + 15
+            randomToken.status = "Loi Check; thu lai sau 15s"
         end
         randomToken.busy = false
     end)
@@ -2476,6 +2577,8 @@ local function finishClearedCombatCamp()
 end
 local function farmStep(dt)
     if not enabled then return end
+    -- [FIX 4] Nhường random token nếu đang trong lúc Purchase
+    if randomToken.busy and randomToken.status == "Quay 500 Magnet Token" then return end
     if not eventStillOpen() then
         if target then resetTarget("het event; chuyen sang Fruit") end
         restoreBring()
